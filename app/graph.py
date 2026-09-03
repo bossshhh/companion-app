@@ -1,0 +1,128 @@
+"""
+LangGraph orchestration for the companion app.
+
+Topology:
+
+    retrieve_memories -> generate_reply --(conditional)--> safety_followup -> store_memory -> END
+                                          \\--(conditional)--> store_memory -> END
+
+`generate_reply`'s conditional edge inspects `state.safety_triggered` and
+routes to `safety_followup` (a distinct node - logs/flags for now, hook for
+a real caregiver-alert integration later) before falling through to the
+same `store_memory` node either way. Routine turns skip straight to
+`store_memory`.
+
+State persists across turns via a LangGraph checkpointer keyed on a thread
+id (`user_id`), which is what makes this a *conversation* rather than a
+sequence of one-shot calls - conversation_history and retrieved_memories
+carry forward.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+
+from app.embeddings import embed_text
+from app.llm_node import StructuredReplyGenerator
+from app.memory_store import MemoryStore
+from app.models import ConversationTurn, GraphState, MemoryCategory, MemoryRecord
+
+logger = logging.getLogger("companion_app.graph")
+
+
+def _format_memory_context(state: GraphState) -> str:
+    """Turn retrieved memories into a short bullet list for the LLM prompt."""
+    if not state.retrieved_memories:
+        return ""
+    lines = []
+    for sm in state.retrieved_memories:
+        tag = " [SAFETY]" if sm.bypassed_by_safety else ""
+        lines.append(f"- {sm.memory.text}{tag}")
+    return "\n".join(lines)
+
+
+def build_graph(store: MemoryStore, generator: StructuredReplyGenerator):
+    """
+    Construct and compile the LangGraph state graph.
+
+    `store` and `generator` are injected rather than constructed inside the
+    node functions, so tests can pass an `InMemoryMockStore` and a stubbed
+    generator without touching the real Anthropic API or a real vector DB.
+    """
+
+    def retrieve_memories_node(state: GraphState) -> dict:
+        query_embedding = embed_text(state.user_input)
+        scored = store.retrieve(query_embedding, top_k=5)
+        return {"retrieved_memories": scored}
+
+    def generate_reply_node(state: GraphState) -> dict:
+        memory_context = _format_memory_context(state)
+        result = generator.generate(state.user_input, memory_context)
+        structured = result.structured
+
+        return {
+            "structured_reply": structured,
+            "final_reply_text": structured.reply_text,
+            "safety_triggered": structured.safety_flag,
+            "llm_call_failed": not result.succeeded,
+            "conversation_history": state.conversation_history
+            + [
+                ConversationTurn(role="user", content=state.user_input),
+                ConversationTurn(role="assistant", content=structured.reply_text),
+            ],
+        }
+
+    def safety_followup_node(state: GraphState) -> dict:
+        # Hook point for a real integration (caregiver notification, logging
+        # to a monitored channel, etc.). For the sprint, this just logs
+        # loudly so it's visible in the demo/dev console.
+        logger.warning(
+            "SAFETY FLAG triggered for user_id=%s | input=%r | reply=%r",
+            state.user_id,
+            state.user_input,
+            state.final_reply_text,
+        )
+        return {}
+
+    def store_memory_node(state: GraphState) -> dict:
+        structured = state.structured_reply
+        if structured is None or not structured.memory_worthy or state.llm_call_failed:
+            # Nothing to store this turn - either not memory-worthy, or the
+            # LLM call degraded to fallback (no reliable importance score).
+            return {}
+
+        summary_text = structured.memory_summary or state.user_input
+        record = MemoryRecord(
+            text=summary_text,
+            embedding=embed_text(summary_text),
+            importance=structured.importance / 10.0,
+            category=MemoryCategory(structured.category),
+            safety_flag=structured.safety_flag,
+        )
+        store.add(record)
+        return {}
+
+    def route_after_reply(state: GraphState) -> str:
+        return "safety_followup" if state.safety_triggered else "store_memory"
+
+    graph = StateGraph(GraphState)
+    graph.add_node("retrieve_memories", retrieve_memories_node)
+    graph.add_node("generate_reply", generate_reply_node)
+    graph.add_node("safety_followup", safety_followup_node)
+    graph.add_node("store_memory", store_memory_node)
+
+    graph.set_entry_point("retrieve_memories")
+    graph.add_edge("retrieve_memories", "generate_reply")
+    graph.add_conditional_edges(
+        "generate_reply",
+        route_after_reply,
+        {"safety_followup": "safety_followup", "store_memory": "store_memory"},
+    )
+    graph.add_edge("safety_followup", "store_memory")
+    graph.add_edge("store_memory", END)
+
+    checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
