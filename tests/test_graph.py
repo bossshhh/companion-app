@@ -136,3 +136,29 @@ def test_conversation_history_accumulates_across_turns():
     result2 = app.invoke({"user_id": user_id, "user_input": "How are you?"}, config=config)
     # checkpointer carries prior history forward within the same thread_id
     assert len(result2["conversation_history"]) == 4
+
+
+def test_safety_flag_forces_safety_category_even_if_llm_disagrees():
+    """
+    Locks in the fix from the eval run: a real LLM call returned
+    safety_flag=True with category='habit' for "forgot my morning pills" -
+    the LLM treats these as independent fields, but a safety-flagged record
+    must always be filed under category=safety regardless of what category
+    the LLM assigned, since downstream alerting/dashboards will filter by
+    category expecting that invariant to hold.
+    """
+    response = StructuredReply(
+        reply_text="Please take them now if you can, and check with your doctor if unsure.",
+        memory_worthy=True,
+        memory_summary="Forgot to take morning pills today",
+        importance=9,
+        category=MemoryCategory.HABIT,  # LLM's (inconsistent) choice
+        safety_flag=True,
+    )
+    generator = StubGenerator(response)
+    result, store = run_turn(generator, "I think I forgot to take my morning pills today")
+
+    assert result["safety_triggered"] is True
+    stored = store.all_records()
+    assert len(stored) == 1
+    assert stored[0].category == MemoryCategory.SAFETY, "safety_flag=True must force category=safety"

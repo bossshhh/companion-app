@@ -3,14 +3,15 @@ LangGraph orchestration for the companion app.
 
 Topology:
 
-    retrieve_memories -> generate_reply --(conditional)--> safety_followup -> store_memory -> END
-                                          \\--(conditional)--> store_memory -> END
+    retrieve_memories -> [detect_emotion] -> generate_reply --(conditional)--> safety_followup -> store_memory -> END
+                                                              \\--(conditional)--> store_memory -> END
 
-`generate_reply`'s conditional edge inspects `state.safety_triggered` and
-routes to `safety_followup` (a distinct node - logs/flags for now, hook for
-a real caregiver-alert integration later) before falling through to the
-same `store_memory` node either way. Routine turns skip straight to
-`store_memory`.
+detect_emotion is OPTIONAL - only added to the graph if an emotion_classifier
+is passed to build_graph(). `generate_reply`'s conditional edge inspects
+`state.safety_triggered` and routes to `safety_followup` (a distinct node -
+logs/flags for now, hook for a real caregiver-alert integration later)
+before falling through to the same `store_memory` node either way. Routine
+turns skip straight to `store_memory`.
 
 State persists across turns via a LangGraph checkpointer keyed on a thread
 id (`user_id`), which is what makes this a *conversation* rather than a
@@ -26,6 +27,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from app.embeddings import embed_text
+from app.emotion_tracker import EmotionClassifier
 from app.llm_node import StructuredReplyGenerator
 from app.memory_store import MemoryStore
 from app.models import ConversationTurn, GraphState, MemoryCategory, MemoryRecord
@@ -44,19 +46,27 @@ def _format_memory_context(state: GraphState) -> str:
     return "\n".join(lines)
 
 
-def build_graph(store: MemoryStore, generator: StructuredReplyGenerator):
+def build_graph(store: MemoryStore, generator: StructuredReplyGenerator, emotion_classifier: EmotionClassifier | None = None):
     """
     Construct and compile the LangGraph state graph.
 
     `store` and `generator` are injected rather than constructed inside the
     node functions, so tests can pass an `InMemoryMockStore` and a stubbed
     generator without touching the real Anthropic API or a real vector DB.
+    `emotion_classifier` is optional - if None, the detect_emotion node is
+    skipped entirely (detected_emotion/detected_emotion_score stay None),
+    so existing callers that don't care about emotion tracking are
+    unaffected.
     """
 
     def retrieve_memories_node(state: GraphState) -> dict:
         query_embedding = embed_text(state.user_input)
         scored = store.retrieve(query_embedding, top_k=5)
         return {"retrieved_memories": scored}
+
+    def detect_emotion_node(state: GraphState) -> dict:
+        result = emotion_classifier.classify(state.user_input)
+        return {"detected_emotion": result.label, "detected_emotion_score": result.score}
 
     def generate_reply_node(state: GraphState) -> dict:
         memory_context = _format_memory_context(state)
@@ -76,9 +86,6 @@ def build_graph(store: MemoryStore, generator: StructuredReplyGenerator):
         }
 
     def safety_followup_node(state: GraphState) -> dict:
-        # Hook point for a real integration (caregiver notification, logging
-        # to a monitored channel, etc.). For the sprint, this just logs
-        # loudly so it's visible in the demo/dev console.
         logger.warning(
             "SAFETY FLAG triggered for user_id=%s | input=%r | reply=%r",
             state.user_id,
@@ -90,16 +97,15 @@ def build_graph(store: MemoryStore, generator: StructuredReplyGenerator):
     def store_memory_node(state: GraphState) -> dict:
         structured = state.structured_reply
         if structured is None or not structured.memory_worthy or state.llm_call_failed:
-            # Nothing to store this turn - either not memory-worthy, or the
-            # LLM call degraded to fallback (no reliable importance score).
             return {}
 
         summary_text = structured.memory_summary or state.user_input
+        category = MemoryCategory.SAFETY if structured.safety_flag else MemoryCategory(structured.category)
         record = MemoryRecord(
             text=summary_text,
             embedding=embed_text(summary_text),
             importance=structured.importance / 10.0,
-            category=MemoryCategory(structured.category),
+            category=category,
             safety_flag=structured.safety_flag,
         )
         store.add(record)
@@ -115,7 +121,12 @@ def build_graph(store: MemoryStore, generator: StructuredReplyGenerator):
     graph.add_node("store_memory", store_memory_node)
 
     graph.set_entry_point("retrieve_memories")
-    graph.add_edge("retrieve_memories", "generate_reply")
+    if emotion_classifier is not None:
+        graph.add_node("detect_emotion", detect_emotion_node)
+        graph.add_edge("retrieve_memories", "detect_emotion")
+        graph.add_edge("detect_emotion", "generate_reply")
+    else:
+        graph.add_edge("retrieve_memories", "generate_reply")
     graph.add_conditional_edges(
         "generate_reply",
         route_after_reply,

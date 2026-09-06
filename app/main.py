@@ -1,7 +1,11 @@
 """
 Manual CLI for exercising the full graph with a real LLM call.
 
-Requires ANTHROPIC_API_KEY to be set in the environment. Run:
+Requires ANTHROPIC_API_KEY to be set in the environment. Memory persists across runs via ChromaDB, stored in ./chroma_data by
+default (gitignored - don't commit it, it'll fill up with test data).
+Delete that directory any time to start fresh with an empty memory store.
+
+Run:
 
     python -m app.main
 
@@ -17,15 +21,15 @@ import logging
 import sys
 import uuid
 
+from app.chroma_store import ChromaMemoryStore
 from app.graph import build_graph
 from app.llm_node import StructuredReplyGenerator
-from app.memory_store import InMemoryMockStore
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
 def main() -> None:
-    store = InMemoryMockStore()
+    store = ChromaMemoryStore()  # persists to ./chroma_data by default
     generator = StructuredReplyGenerator()
     app = build_graph(store, generator)
 

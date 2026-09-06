@@ -128,6 +128,11 @@ class GraphState(BaseModel):
     structured_reply: Optional[StructuredReply] = None
     final_reply_text: str = ""
 
+    # emotion tracker output - independent of the LLM's own StructuredReply
+    # category/importance judgment, so the two can be compared/cross-checked
+    detected_emotion: Optional[str] = None
+    detected_emotion_score: Optional[float] = None
+
     # routing / control flags set by nodes, read by conditional edges
     safety_triggered: bool = False
     llm_call_failed: bool = False
