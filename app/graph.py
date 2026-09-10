@@ -5,23 +5,12 @@ Topology:
 
     retrieve_memories -> [detect_emotion] -> generate_reply --(conditional)--> safety_followup -> store_memory -> END
                                                               \\--(conditional)--> store_memory -> END
-
-detect_emotion is OPTIONAL - only added to the graph if an emotion_classifier
-is passed to build_graph(). `generate_reply`'s conditional edge inspects
-`state.safety_triggered` and routes to `safety_followup` (a distinct node -
-logs/flags for now, hook for a real caregiver-alert integration later)
-before falling through to the same `store_memory` node either way. Routine
-turns skip straight to `store_memory`.
-
-State persists across turns via a LangGraph checkpointer keyed on a thread
-id (`user_id`), which is what makes this a *conversation* rather than a
-sequence of one-shot calls - conversation_history and retrieved_memories
-carry forward.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
@@ -36,7 +25,6 @@ logger = logging.getLogger("companion_app.graph")
 
 
 def _format_memory_context(state: GraphState) -> str:
-    """Turn retrieved memories into a short bullet list for the LLM prompt."""
     if not state.retrieved_memories:
         return ""
     lines = []
@@ -46,21 +34,20 @@ def _format_memory_context(state: GraphState) -> str:
     return "\n".join(lines)
 
 
-def build_graph(store: MemoryStore, generator: StructuredReplyGenerator, emotion_classifier: EmotionClassifier | None = None):
+def build_graph(
+    store: MemoryStore,
+    generator: StructuredReplyGenerator,
+    emotion_classifier: EmotionClassifier | None = None,
+    embed_fn: Callable[[str], list[float]] = embed_text,
+):
     """
-    Construct and compile the LangGraph state graph.
-
-    `store` and `generator` are injected rather than constructed inside the
-    node functions, so tests can pass an `InMemoryMockStore` and a stubbed
-    generator without touching the real Anthropic API or a real vector DB.
-    `emotion_classifier` is optional - if None, the detect_emotion node is
-    skipped entirely (detected_emotion/detected_emotion_score stay None),
-    so existing callers that don't care about emotion tracking are
-    unaffected.
+    embed_fn defaults to the fast fake embedding (app.embeddings.embed_text)
+    so every existing caller/test keeps working unchanged - pass
+    app.embeddings.real_embed_text here in production.
     """
 
     def retrieve_memories_node(state: GraphState) -> dict:
-        query_embedding = embed_text(state.user_input)
+        query_embedding = embed_fn(state.user_input)
         scored = store.retrieve(query_embedding, top_k=5)
         return {"retrieved_memories": scored}
 
@@ -103,7 +90,7 @@ def build_graph(store: MemoryStore, generator: StructuredReplyGenerator, emotion
         category = MemoryCategory.SAFETY if structured.safety_flag else MemoryCategory(structured.category)
         record = MemoryRecord(
             text=summary_text,
-            embedding=embed_text(summary_text),
+            embedding=embed_fn(summary_text),
             importance=structured.importance / 10.0,
             category=category,
             safety_flag=structured.safety_flag,

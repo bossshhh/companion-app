@@ -2,14 +2,9 @@
 Embedding provider abstraction.
 
 `fake_embedding()` is a deterministic, dependency-free stand-in used for
-local development and tests so the retrieval-scoring logic can be built and
-verified without waiting on the real embedding pipeline (whichever model
-the vector-storage teammate picks - likely a sentence-transformers model or
-an API-based embedder).
-
-Swap `embed_text()` for a real call once that pipeline exists. The rest of
-this codebase only depends on "text in, list[float] out, fixed dimension" -
-nothing else needs to change.
+local development and tests. `real_embed_text()` uses the same
+all-MiniLM-L6-v2 sentence-transformers model Mahir's persona pipeline
+uses, so both pipelines produce vectors in the same embedding space.
 """
 
 from __future__ import annotations
@@ -20,26 +15,16 @@ EMBEDDING_DIM = 64
 
 
 def fake_embedding(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
-    """
-    Deterministic pseudo-embedding derived from a hash of the text.
-
-    NOT semantically meaningful across arbitrary text - it will not cluster
-    synonyms the way a real embedding model does. It IS deterministic and
-    stable (same text -> same vector), which is exactly what's needed to
-    unit-test the scoring math (relevance, recency, importance composition)
-    without a real model in the loop. Replace with a real embedder before
-    the retrieval quality actually matters for the demo.
-    """
+    """Deterministic pseudo-embedding derived from a hash of the text. NOT
+    semantically meaningful - used only to keep tests fast and offline."""
     if not text:
         raise ValueError("text must not be empty")
 
     digest = hashlib.sha256(text.encode("utf-8")).digest()
-    # Expand the 32-byte digest into `dim` floats in [-1, 1] deterministically.
     values: list[float] = []
     i = 0
     while len(values) < dim:
         byte = digest[i % len(digest)]
-        # mix in the index so repeated cycles through the digest don't repeat values
         mixed = (byte + i * 31) % 256
         values.append((mixed / 255.0) * 2.0 - 1.0)
         i += 1
@@ -47,10 +32,42 @@ def fake_embedding(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
 
 
 def embed_text(text: str) -> list[float]:
-    """
-    Public entry point used by the rest of the app. Currently delegates to
-    the fake embedding. Replace this function's body with a real embedding
-    API/model call when the teammate's pipeline is ready - callers don't
-    need to change.
-    """
+    """Fast, dependency-free embedding used as the DEFAULT everywhere in
+    this codebase (tests, demo.py, eval_conversations.py). Production code
+    should pass real_embed_text as embed_fn to build_graph() instead."""
     return fake_embedding(text)
+
+
+# Matches Mahir's persona pipeline's embedding model - same model matters
+# here, not just "any real model": two different embedding models produce
+# vectors in different, non-comparable spaces.
+SENTENCE_TRANSFORMER_MODEL_NAME = "all-MiniLM-L6-v2"
+
+
+class SentenceTransformerEmbedder:
+    """Real embedding model wrapper. Lazily imports sentence_transformers
+    inside __init__, not at module level, so importing this file never
+    requires the package or model download to be present."""
+
+    def __init__(self, model_name: str = SENTENCE_TRANSFORMER_MODEL_NAME) -> None:
+        from sentence_transformers import SentenceTransformer
+
+        self._model = SentenceTransformer(model_name)
+
+    def embed(self, text: str) -> list[float]:
+        if not text.strip():
+            raise ValueError("text must not be empty")
+        vector = self._model.encode(text, convert_to_numpy=True)
+        return vector.tolist()
+
+
+_real_embedder: SentenceTransformerEmbedder | None = None
+
+
+def real_embed_text(text: str) -> list[float]:
+    """Real embedding entry point - pass as embed_fn to build_graph() in
+    production. Lazily constructs and caches a single embedder instance."""
+    global _real_embedder
+    if _real_embedder is None:
+        _real_embedder = SentenceTransformerEmbedder()
+    return _real_embedder.embed(text)

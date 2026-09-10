@@ -162,3 +162,36 @@ def test_safety_flag_forces_safety_category_even_if_llm_disagrees():
     stored = store.all_records()
     assert len(stored) == 1
     assert stored[0].category == MemoryCategory.SAFETY, "safety_flag=True must force category=safety"
+
+
+def test_custom_embed_fn_is_actually_used():
+    """
+    Proves build_graph()'s embed_fn injection works end-to-end.
+    """
+    calls: list[str] = []
+
+    def tracking_embed_fn(text: str) -> list[float]:
+        calls.append(text)
+        return [1.0, 0.0, 0.0]
+
+    response = StructuredReply(
+        reply_text="Noted.",
+        memory_worthy=True,
+        memory_summary="Enjoys painting on weekends",
+        importance=4,
+        category=MemoryCategory.HABIT,
+        safety_flag=False,
+    )
+    generator = StubGenerator(response)
+    store = InMemoryMockStore()
+    app = build_graph(store, generator, embed_fn=tracking_embed_fn)
+    user_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": user_id}}
+
+    app.invoke({"user_id": user_id, "user_input": "I paint on weekends"}, config=config)
+
+    assert "I paint on weekends" in calls
+    assert "Enjoys painting on weekends" in calls
+    stored = store.all_records()
+    assert len(stored) == 1
+    assert stored[0].embedding == [1.0, 0.0, 0.0]
