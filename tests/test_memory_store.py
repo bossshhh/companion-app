@@ -100,3 +100,21 @@ def test_touch_updates_access_metadata():
 
     stored = store.all_records()[0]
     assert stored.access_count == original_access_count + 1
+
+
+def test_safety_bypass_is_capped_at_scale():
+    """
+    Locks in the fix for a real scaling problem: with many safety-flagged
+    memories stored, the safety bypass must NOT return all of them
+    unconditionally - only the top max_safety_bypass by composite score.
+    """
+    store = InMemoryMockStore()
+
+    for i in range(10):
+        store.add(make_record(f"Safety concern number {i}", importance=0.5, hours_ago=i, safety_flag=True))
+
+    query = embed_text("How is your day going?")
+    results = store.retrieve(query, top_k=5, max_safety_bypass=3)
+
+    safety_results = [r for r in results if r.bypassed_by_safety]
+    assert len(safety_results) == 3, "safety bypass must be capped, not unbounded"

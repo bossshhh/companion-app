@@ -83,3 +83,53 @@ def test_conversation_persists_across_requests_for_same_user():
     r2 = client.post("/chat", json={"user_id": "persistent-user", "message": "how are you"})
     assert r1.status_code == 200
     assert r2.status_code == 200
+
+
+from app.voice_synthesis import VoiceSynthesisError, VoiceSynthesizer
+
+
+class StubVoiceSynthesizer(VoiceSynthesizer):
+    def __init__(self, audio_bytes: bytes = b"fake-mp3-bytes", should_fail: bool = False):
+        self._audio_bytes = audio_bytes
+        self._should_fail = should_fail
+        self.calls: list[str] = []
+
+    def synthesize(self, text: str) -> bytes:
+        self.calls.append(text)
+        if self._should_fail:
+            raise VoiceSynthesisError("simulated ElevenLabs failure")
+        return self._audio_bytes
+
+
+def test_speak_without_synthesizer_configured_returns_503():
+    app = create_app(InMemoryMockStore(), StubGenerator(_routine_response()))
+    client = TestClient(app)
+    response = client.post("/speak", json={"text": "Hello there"})
+    assert response.status_code == 503
+
+
+def test_speak_returns_audio_bytes():
+    synthesizer = StubVoiceSynthesizer(audio_bytes=b"totally-real-mp3-data")
+    app = create_app(InMemoryMockStore(), StubGenerator(_routine_response()), voice_synthesizer=synthesizer)
+    client = TestClient(app)
+    response = client.post("/speak", json={"text": "Hello there"})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.content == b"totally-real-mp3-data"
+    assert synthesizer.calls == ["Hello there"]
+
+
+def test_speak_synthesis_failure_returns_502():
+    synthesizer = StubVoiceSynthesizer(should_fail=True)
+    app = create_app(InMemoryMockStore(), StubGenerator(_routine_response()), voice_synthesizer=synthesizer)
+    client = TestClient(app)
+    response = client.post("/speak", json={"text": "Hello there"})
+    assert response.status_code == 502
+
+
+def test_speak_empty_text_returns_422():
+    synthesizer = StubVoiceSynthesizer()
+    app = create_app(InMemoryMockStore(), StubGenerator(_routine_response()), voice_synthesizer=synthesizer)
+    client = TestClient(app)
+    response = client.post("/speak", json={"text": ""})
+    assert response.status_code == 422
